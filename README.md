@@ -235,6 +235,32 @@ division (masked-divide speculation) plus f64/f32 mixing. Upstream:
 sites: index load `src/gap_bc.c:123`, deltas gather `:126`.
 *Args:* `nodes edges source seed`
 
+#### `src/gap_pr.c` — PageRank (pull, Gauss-Seidel)
+
+GAPBS PageRankPullGS semantics: pull-direction updates with
+immediately-visible scores, damping 0.85, epsilon 1e-4. The one GAP
+kernel gcc CAN autovectorize — but only as the e64m2 widening chain;
+this is the e32m1 intrinsic form (scalar implementation in the same
+file as the bit-exact reference). Upstream indirect access:
+[`pr.cc:49`](https://github.com/sbeamer/gapbs/blob/2972aeb2703165bafd921222f4ed7196f542d3a8/src/pr.cc#L49) (`outgoing_contrib[v]`, pull loop
+46-54). Local sites: index load `src/gap_pr.c:87`, contrib gather
+`:90`.
+*Args:* `nodes edges max_iters seed`
+
+#### `src/rivec_spmv.c` — CSR SpMV
+
+RiVec `_spmv` semantics: `y[r] = Σ a[k] * x[ja[k]]` over CSR
+(synthetic uniform column indices, fixed nnz/row). Upstream
+([RALC88/riscv-vectorized-benchmark-suite `_spmv/src/spmv.c`](https://github.com/RALC88/riscv-vectorized-benchmark-suite/blob/master/_spmv/src/spmv.c)):
+serial indirect read `sum += a[idx] * x[ja[idx]]` at L50, vector
+gather `_MM_LOAD_INDEX_f64(x, v_idx_row, gvl)` at L37 — upstream is
+f64/64-bit-index; this port is f32/int32 per the suite's e32m1 rule,
+raw intrinsics. Autovec is not trusted here for the same reason as
+gap_pr (it emits the widening chain), so the kernel is intrinsic
+with autovec off. Local sites: index load `src/rivec_spmv.c:62`,
+x gather `:64`.
+*Args:* `rows cols nnz_per_row seed`
+
 ## Verification & goldens
 
 Every run executes the scalar reference after the ROI and compares
@@ -254,6 +280,8 @@ gem5 runs) must reproduce them exactly:
 | gap_cc_sv | `65536 262144 1` | `698770` (`0x1.55324p+19`) |
 | gap_sssp | `65536 262144 3 16 1` | `6563865358780` (`0x1.7e11373c6fp+42`) |
 | gap_bc | `65536 262144 3 1` | `376576.9998091124` (`0x1.6fc03ffcdf5cp+18`) |
+| gap_pr | `65536 262144 20 1` | `0.99965455636402112` (`0x1.ffd2b8d5c3p-1`) |
+| rivec_spmv | `65536 65536 16 1` | `-253.21489938267041` (`-0x1.fa6e074ab9p+7`) |
 
 Regenerate with `make host` and running the `_host` binaries with the
 args above.

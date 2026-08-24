@@ -13,7 +13,7 @@
 # -ffp-contract=off everywhere: vector, serial, and host results are
 # bit-identical, so the checksums in golden/ are exact references.
 
-BENCHES = sls paged_attn moe_dispatch fasttext_sg gap_bfs gap_cc gap_cc_sv gap_sssp gap_bc
+BENCHES = sls paged_attn moe_dispatch fasttext_sg gap_bfs gap_cc gap_cc_sv gap_sssp gap_bc gap_pr rivec_spmv
 
 RVTOOLS ?= $(HOME)/opt/riscv/bin
 RVGCC ?= $(RVTOOLS)/riscv64-unknown-elf-gcc
