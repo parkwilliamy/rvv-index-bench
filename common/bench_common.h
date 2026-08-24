@@ -41,6 +41,16 @@ static inline void print_checksum(const char *tag, const float *v,
   printf("checksum %s: %.17g (%a)\n", tag, acc, acc);
 }
 
+// Integer-array checksum: sums fit double's 53-bit mantissa exactly
+// for the sizes used here, so the printed value is exact.
+static inline void print_checksum_i32(const char *tag, const int32_t *v,
+                                      int64_t n) {
+  double acc = 0.0;
+  for (int64_t i = 0; i < n; i++)
+    acc += (double)v[i];
+  printf("checksum %s: %.17g (%a)\n", tag, acc, acc);
+}
+
 static inline int is_pow2(int x) { return x > 0 && (x & (x - 1)) == 0; }
 
 #endif // RVV_INDEX_BENCH_COMMON_H

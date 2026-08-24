@@ -1,0 +1,3 @@
+checksum fasttext_sg_wi: -9.62623206884561 (-0x1.340a17d5ecbfp+3)
+checksum fasttext_sg_wo: 0.057688921787500735 (0x1.d896700d66f4p-5)
+RESULT: PASS
