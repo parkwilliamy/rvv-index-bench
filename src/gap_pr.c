@@ -103,20 +103,32 @@ static void pr_rvv(const GapCsr *g, int max_iters, float *scores,
 #endif
 
 int main(int argc, char **argv) {
+  const int file_mode = argc > 1 && strcmp(argv[1], "-f") == 0;
   if (argc != 5) {
-    fprintf(stderr, "usage: gap_pr <nodes> <edges> <max_iters> <seed>\n");
+    fprintf(stderr, "usage: gap_pr <nodes> <edges> <max_iters> <seed>\n"
+            "       gap_pr -f <graph.bfs> <max_iters> <seed>\n");
     return 2;
   }
-  int32_t n = atoi(argv[1]);
-  int64_t e = atoll(argv[2]);
+  // Graph source: synthetic (nodes/edges) or a .bfs image (-f).
+  // In file mode argv[2] is the path and the remaining
+  // positional args shift down by one.
+  int32_t n = 0; int64_t e = 0;
   int max_iters = atoi(argv[3]);
   uint64_t seed = (uint64_t)strtoull(argv[4], NULL, 0);
-  if (n <= 1 || e <= 0 || max_iters <= 0) {
-    fprintf(stderr, "error: bad sizes\n");
-    return 2;
+  if (!file_mode) {
+    n = atoi(argv[1]);
+    e = atoll(argv[2]);
+    if (n <= 1 || e <= 0) { fprintf(stderr, "error: bad sizes\n"); return 2; }
   }
   GapCsr g;
-  if (!gap_gen(n, e, 0, &seed, &g)) { fprintf(stderr, "oom\n"); return 2; }
+  if (file_mode) {
+    if (!gap_load(argv[2], 0, &seed, &g)) return 2;
+  } else {
+    if (!gap_gen(n, e, 0, &seed, &g)) { fprintf(stderr, "oom\n"); return 2; }
+  }
+  n = g.n;  // authoritative after either path
+  if (max_iters <= 0) { fprintf(stderr, "error: bad max_iters\n"); return 2; }
+
   float *scores = (float *)malloc((size_t)n * sizeof(float));
   float *contrib = (float *)malloc((size_t)n * sizeof(float));
   float *ref = (float *)malloc((size_t)n * sizeof(float));

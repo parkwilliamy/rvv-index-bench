@@ -27,6 +27,9 @@
  * details; distinctness makes the scatters conflict-free so vector
  * and scalar results are bit-identical).
  *
+ * Element sizes are the upstream ones already: fastText matrices
+ * are float and its ids are int32_t.
+ *
  * RVV formulation: both matrices stay ROW-MAJOR; the vector axis is
  * the BAG (input side) or the SAMPLE SET (output side), dim-outer:
  * vle32 ids -> vsll -> vluxei32 gathers for hidden/dots/grad, and

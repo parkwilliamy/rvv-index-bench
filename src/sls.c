@@ -15,11 +15,13 @@
  * pooling dominates production inference; indices are uniform over
  * the table (pass a different seed per run for a different draw).
  *
- * RVV formulation: the table stays ROW-MAJOR (faithful to FBGEMM);
- * the vector axis is the BAG — vle32 the bag's ids, vsll to byte
- * offsets, vluxei32 one component d from L different rows, ordered
- * redsum, loop d. This is the canonical index-load -> gather chain
- * (base + (idx << log2(D*4)), bias d*4 folded into the base).
+ * RVV formulation: the table stays ROW-MAJOR and the indices stay
+ * INT64 (PyTorch EmbeddingBag's index dtype; FBGEMM's IndexType) —
+ * upstream element sizes, not narrowed. The vector axis is the BAG:
+ * vle64 the bag's ids, vsll to byte offsets, vluxei64 one f32
+ * component d from L different rows (mixed-EEW gather: 64-bit
+ * offsets, 32-bit data), ordered redsum, loop d — the canonical
+ * index-load -> gather chain (base + (idx << log2(D*4))).
  *
  * Why the compiler cannot do this on its own: on the natural layout
  * the pooling loop nest is (b, i, d) with the indirection in the ROW
@@ -46,7 +48,7 @@
 // Scalar reference (also the serial variant's timed kernel). Loop
 // order (b, d, i ascending) matches the RVV ordered-redsum exactly,
 // so vector and scalar results are bit-identical.
-static void sls_scalar(const float *table, const int32_t *ids,
+static void sls_scalar(const float *table, const int64_t *ids,
                        int B, int L, int D, float *out) {
   for (int b = 0; b < B; b++)
     for (int d = 0; d < D; d++) {
@@ -58,21 +60,21 @@ static void sls_scalar(const float *table, const int32_t *ids,
 }
 
 #ifdef USE_RISCV_VECTOR
-static void sls_rvv(const float *table, const int32_t *ids,
+static void sls_rvv(const float *table, const int64_t *ids,
                     int B, int L, int D, float *out) {
   const int shift = __builtin_ctz((unsigned)D) + 2; // id -> byte offset
   for (int b = 0; b < B; b++) {
-    const int32_t *bag = &ids[(size_t)b * L];
+    const int64_t *bag = &ids[(size_t)b * L];
     for (int d = 0; d < D; d++) {
       vfloat32m1_t acc = __riscv_vfmv_s_f_f32m1(0.0f, 1);
       size_t vl;
       for (int i = 0; i < L; i += (int)vl) {
         vl = __riscv_vsetvl_e32m1((size_t)(L - i));
-        vuint32m1_t voff = __riscv_vsll_vx_u32m1(
-            __riscv_vreinterpret_v_i32m1_u32m1(
-                __riscv_vle32_v_i32m1(&bag[i], vl)),
+        vuint64m2_t voff = __riscv_vsll_vx_u64m2(
+            __riscv_vreinterpret_v_i64m2_u64m2(
+                __riscv_vle64_v_i64m2(&bag[i], vl)),
             shift, vl);
-        vfloat32m1_t vals = __riscv_vluxei32_v_f32m1(&table[d], voff, vl);
+        vfloat32m1_t vals = __riscv_vluxei64_v_f32m1(&table[d], voff, vl);
         acc = __riscv_vfredosum_vs_f32m1_f32m1(vals, acc, vl);
       }
       out[(size_t)b * D + d] = __riscv_vfmv_f_s_f32m1_f32(acc);
@@ -95,14 +97,14 @@ int main(int argc, char **argv) {
   }
 
   float *table = (float *)malloc((size_t)N * D * sizeof(float));
-  int32_t *ids = (int32_t *)malloc((size_t)B * L * sizeof(int32_t));
+  int64_t *ids = (int64_t *)malloc((size_t)B * L * sizeof(int64_t));
   float *out = (float *)malloc((size_t)B * D * sizeof(float));
   float *ref = (float *)malloc((size_t)B * D * sizeof(float));
   if (!table || !ids || !out || !ref) { fprintf(stderr, "oom\n"); return 2; }
 
   for (size_t i = 0; i < (size_t)N * D; i++) table[i] = sm64_float(&seed);
   for (size_t i = 0; i < (size_t)B * L; i++)
-    ids[i] = (int32_t)sm64_range(&seed, (uint32_t)N);
+    ids[i] = (int64_t)sm64_range(&seed, (uint32_t)N);
 
   ROI_BEGIN();
 #ifdef USE_RISCV_VECTOR

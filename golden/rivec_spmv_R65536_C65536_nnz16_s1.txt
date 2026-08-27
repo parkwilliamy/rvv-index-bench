@@ -1,2 +1,2 @@
-checksum rivec_spmv: -253.21489938267041 (-0x1.fa6e074ab9p+7)
+checksum rivec_spmv: -253.21490919923698 (-0x1.fa6e08941caa3p+7)
 RESULT: PASS

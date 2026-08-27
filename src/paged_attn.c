@@ -58,7 +58,7 @@ static void softmax(float *s, int T) {
 // Scalar reference / serial timed kernel. Score loop d ascending and
 // output loop t ascending match the vector op order exactly.
 static void attn_scalar(const float *q, const float *kc, const float *vc,
-                        const int32_t *row_off, int T, int D,
+                        const int64_t *row_off, int T, int D,
                         float inv_sqrt_d, float *s, float *o) {
   for (int t = 0; t < T; t++) {
     const float *krow = (const float *)((const char *)kc + row_off[t]);
@@ -80,17 +80,17 @@ static void attn_scalar(const float *q, const float *kc, const float *vc,
 
 #ifdef USE_RISCV_VECTOR
 static void attn_rvv(const float *q, const float *kc, const float *vc,
-                     const int32_t *row_off, int T, int D,
+                     const int64_t *row_off, int T, int D,
                      float inv_sqrt_d, float *s, float *o) {
   size_t vl;
   // Phase 1: scores, token strips; K gathered per component.
   for (int t = 0; t < T; t += (int)vl) {
     vl = __riscv_vsetvl_e32m1((size_t)(T - t));
-    vuint32m1_t voff = __riscv_vreinterpret_v_i32m1_u32m1(
-        __riscv_vle32_v_i32m1(&row_off[t], vl));
+    vuint64m2_t voff = __riscv_vreinterpret_v_i64m2_u64m2(
+        __riscv_vle64_v_i64m2(&row_off[t], vl));
     vfloat32m1_t vs = __riscv_vfmv_v_f_f32m1(0.0f, vl);
     for (int d = 0; d < D; d++) {
-      vfloat32m1_t vk = __riscv_vluxei32_v_f32m1(&kc[d], voff, vl);
+      vfloat32m1_t vk = __riscv_vluxei64_v_f32m1(&kc[d], voff, vl);
       // unfused mul+add: bit-exact vs the -ffp-contract=off scalar
       vs = __riscv_vfadd_vv_f32m1(
           vs, __riscv_vfmul_vf_f32m1(vk, q[d], vl), vl);
@@ -104,9 +104,9 @@ static void attn_rvv(const float *q, const float *kc, const float *vc,
     vfloat32m1_t acc = __riscv_vfmv_s_f_f32m1(0.0f, 1);
     for (int t = 0; t < T; t += (int)vl) {
       vl = __riscv_vsetvl_e32m1((size_t)(T - t));
-      vuint32m1_t voff = __riscv_vreinterpret_v_i32m1_u32m1(
-          __riscv_vle32_v_i32m1(&row_off[t], vl));
-      vfloat32m1_t vv = __riscv_vluxei32_v_f32m1(&vc[d], voff, vl);
+      vuint64m2_t voff = __riscv_vreinterpret_v_i64m2_u64m2(
+          __riscv_vle64_v_i64m2(&row_off[t], vl));
+      vfloat32m1_t vv = __riscv_vluxei64_v_f32m1(&vc[d], voff, vl);
       vfloat32m1_t vp = __riscv_vle32_v_f32m1(&s[t], vl);
       acc = __riscv_vfredosum_vs_f32m1_f32m1(
           __riscv_vfmul_vv_f32m1(vv, vp, vl), acc, vl);
@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
   float *vc = (float *)malloc(cache_elems * sizeof(float));
   float *q = (float *)malloc((size_t)D * sizeof(float));
   int32_t *block_table = (int32_t *)malloc((size_t)NB * sizeof(int32_t));
-  int32_t *row_off = (int32_t *)malloc((size_t)T * sizeof(int32_t));
+  int64_t *row_off = (int64_t *)malloc((size_t)T * sizeof(int64_t));
   float *s = (float *)malloc((size_t)T * sizeof(float));
   float *o = (float *)malloc((size_t)D * sizeof(float));
   float *s_ref = (float *)malloc((size_t)T * sizeof(float));
@@ -161,7 +161,7 @@ int main(int argc, char **argv) {
   // Resolve the two-level indirection into byte offsets (the index
   // stream the gathers consume).
   for (int t = 0; t < T; t++)
-    row_off[t] = (int32_t)(((size_t)block_table[t / PS] * PS + t % PS) *
+    row_off[t] = (int64_t)(((size_t)block_table[t / PS] * PS + t % PS) *
                            D * sizeof(float));
 
   const float inv_sqrt_d = 1.0f / sqrtf((float)D);

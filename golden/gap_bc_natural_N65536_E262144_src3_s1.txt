@@ -1,0 +1,2 @@
+checksum gap_bc_natural: 376576.9998091124 (0x1.6fc03ffcdf5cp+18)
+RESULT: PASS

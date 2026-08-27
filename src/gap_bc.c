@@ -13,13 +13,15 @@
  * normalization is a dense epilogue irrelevant to indexing).
  *
  * RVV formulation (ported from the ~/gapbs vectorization): per
- * successor strip, vle32 the neighbor ids and vluxei32 deltas[]
- * (f32, e32m1); the f64 path_counts stay scalar in the consume loop
- * (no widening chains), and the per-edge succ byte is SEQUENTIAL,
- * not gathered. deltas[] of depth d+1 are finalized before depth d
- * runs and writes go to deltas[u]/scores[u] only, so
- * gather-then-consume is exact; every FP op is a single rounding in
- * both builds, so results are bit-identical.
+ * successor strip, vle32 the neighbor ids feed TWO gathers at the
+ * upstream element sizes — vluxei32 of deltas[] (f32) and a
+ * mixed-EEW vluxei32 of path_counts[] (f64, 32-bit offsets scaled
+ * <<3) — matching gapbs, which reads both arrays indirectly. The
+ * per-edge succ byte is SEQUENTIAL, not gathered. deltas[]/
+ * path_counts[] of depth d+1 are finalized before depth d runs and
+ * writes go to deltas[u]/scores[u] only, so gather-then-consume is
+ * exact; every FP op is a single rounding in both builds, so results
+ * are bit-identical.
  *
  * Why the compiler cannot vectorize it (verified on gapbs with gcc
  * -O3 -ftree-vectorize: zero kernel gathers): a conditional guards
@@ -109,6 +111,7 @@ static void backward_rvv(const GapCsr *g, const double *path_counts,
                          const int64_t *depth_index, int n_depths,
                          float *deltas, float *scores) {
   float dbuf[VBUF_LANES];
+  double pcbuf[VBUF_LANES];
   for (int d = n_depths - 1; d >= 0; d--) {
     for (int64_t i = depth_index[d]; i < depth_index[d + 1]; i++) {
       int32_t u = queue[i];
@@ -116,18 +119,20 @@ static void backward_rvv(const GapCsr *g, const double *path_counts,
       const int32_t *neigh = &g->dat[g->off[u]];
       const uint8_t *sbits = &succ[g->off[u]];
       const int32_t deg = g->off[u + 1] - g->off[u];
+      const double pc_u = path_counts[u];
       for (int32_t k = 0; k < deg; ) {
         size_t vl = __riscv_vsetvl_e32m1((size_t)(deg - k));
-        vuint32m1_t voff = __riscv_vsll_vx_u32m1(
-            __riscv_vreinterpret_v_i32m1_u32m1(
-                __riscv_vle32_v_i32m1(&neigh[k], vl)),
-            2, vl);
+        vuint32m1_t vidx = __riscv_vreinterpret_v_i32m1_u32m1(
+            __riscv_vle32_v_i32m1(&neigh[k], vl));
         __riscv_vse32_v_f32m1(
-            dbuf, __riscv_vluxei32_v_f32m1(deltas, voff, vl), vl);
+            dbuf, __riscv_vluxei32_v_f32m1(
+                deltas, __riscv_vsll_vx_u32m1(vidx, 2, vl), vl), vl);
+        __riscv_vse64_v_f64m2(
+            pcbuf, __riscv_vluxei32_v_f64m2(
+                path_counts, __riscv_vsll_vx_u32m1(vidx, 3, vl), vl), vl);
         for (size_t j = 0; j < vl; j++) {
           if (sbits[k + (int32_t)j]) {
-            int32_t v = neigh[k + (int32_t)j];
-            delta_u += (float)((path_counts[u] / path_counts[v]) *
+            delta_u += (float)((pc_u / pcbuf[j]) *
                                (1.0 + (double)dbuf[j]));
           }
         }
@@ -141,20 +146,35 @@ static void backward_rvv(const GapCsr *g, const double *path_counts,
 #endif
 
 int main(int argc, char **argv) {
+  const int file_mode = argc > 1 && strcmp(argv[1], "-f") == 0;
   if (argc != 5) {
-    fprintf(stderr, "usage: gap_bc <nodes> <edges> <source> <seed>\n");
+    fprintf(stderr, "usage: gap_bc <nodes> <edges> <source> <seed>\n"
+            "       gap_bc -f <graph.bfs> <source> <seed>\n");
     return 2;
   }
-  int32_t n = atoi(argv[1]);
-  int64_t e = atoll(argv[2]);
+  // Graph source: synthetic (nodes/edges) or a .bfs image (-f).
+  // In file mode argv[2] is the path and the remaining
+  // positional args shift down by one.
+  int32_t n = 0; int64_t e = 0;
   int32_t source = atoi(argv[3]);
   uint64_t seed = (uint64_t)strtoull(argv[4], NULL, 0);
-  if (n <= 1 || e <= 0 || source < 0 || source >= n) {
-    fprintf(stderr, "error: bad sizes/source\n");
-    return 2;
+  if (!file_mode) {
+    n = atoi(argv[1]);
+    e = atoll(argv[2]);
+    if (n <= 1 || e <= 0) { fprintf(stderr, "error: bad sizes\n"); return 2; }
   }
   GapCsr g;
-  if (!gap_gen(n, e, 0, &seed, &g)) { fprintf(stderr, "oom\n"); return 2; }
+  if (file_mode) {
+    if (!gap_load(argv[2], 0, &seed, &g)) return 2;
+  } else {
+    if (!gap_gen(n, e, 0, &seed, &g)) { fprintf(stderr, "oom\n"); return 2; }
+  }
+  n = g.n;  // authoritative after either path
+  if (source < 0 || source >= n) {
+    fprintf(stderr, "error: source out of range [0,%d)\n", n);
+    return 2;
+  }
+
   double *path_counts = (double *)malloc((size_t)n * sizeof(double));
   uint8_t *succ = (uint8_t *)calloc((size_t)g.m, 1);
   int32_t *queue = (int32_t *)malloc((size_t)n * sizeof(int32_t));

@@ -66,9 +66,13 @@ addition.
 - Sizes that feed shift-based addressing must be powers of two
   (`dim` in the existing kernels) — offsets are `id << log2(row
   bytes)`, which keeps the chain in `base + (idx << shift)` form.
-- **e32m1 only**: no widening/narrowing chains, no fractional LMUL,
-  no segment ops, no partial-lane accumulator idioms, no
-  `vcompress` — these hit known gem5 RVV model bugs.
+- **Use the UPSTREAM element sizes** (int64 indices where PyTorch/
+  RiVec use them, f64 where the original kernel is double, etc.);
+  mixed-EEW gathers (`vluxei64` of f32, `vluxei32` of f64) are fine.
+  Still banned: segment ops, narrowing chains (`vnsrl`/`vfncvt`),
+  partial-lane accumulator idioms, and `vcompress` — those hit known
+  gem5 RVV model bugs. (The former e32m1-only rule existed for the
+  reduction dependency race fixed 2026-08-24.)
 - Scatters must be **conflict-free by construction** (distinct ids /
   permutations), stated in the source header, so vector and scalar
   results stay bit-identical.

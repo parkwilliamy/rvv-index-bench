@@ -41,6 +41,14 @@ static inline void print_checksum(const char *tag, const float *v,
   printf("checksum %s: %.17g (%a)\n", tag, acc, acc);
 }
 
+static inline void print_checksum_f64(const char *tag, const double *v,
+                                      int64_t n) {
+  double acc = 0.0;
+  for (int64_t i = 0; i < n; i++)
+    acc += v[i];
+  printf("checksum %s: %.17g (%a)\n", tag, acc, acc);
+}
+
 // Integer-array checksum: sums fit double's 53-bit mantissa exactly
 // for the sizes used here, so the printed value is exact.
 static inline void print_checksum_i32(const char *tag, const int32_t *v,

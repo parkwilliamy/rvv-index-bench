@@ -159,20 +159,35 @@ static void dobfs(const GapCsr *g, int32_t source, int32_t *parent,
 }
 
 int main(int argc, char **argv) {
+  const int file_mode = argc > 1 && strcmp(argv[1], "-f") == 0;
   if (argc != 5) {
-    fprintf(stderr, "usage: gap_bfs <nodes> <edges> <source> <seed>\n");
+    fprintf(stderr, "usage: gap_bfs <nodes> <edges> <source> <seed>\n"
+            "       gap_bfs -f <graph.bfs> <source> <seed>\n");
     return 2;
   }
-  int32_t n = atoi(argv[1]);
-  int64_t e = atoll(argv[2]);
+  // Graph source: synthetic (nodes/edges) or a .bfs image (-f).
+  // In file mode argv[2] is the path and the remaining
+  // positional args shift down by one.
+  int32_t n = 0; int64_t e = 0;
   int32_t source = atoi(argv[3]);
   uint64_t seed = (uint64_t)strtoull(argv[4], NULL, 0);
-  if (n <= 1 || e <= 0 || source < 0 || source >= n) {
-    fprintf(stderr, "error: bad sizes/source\n");
-    return 2;
+  if (!file_mode) {
+    n = atoi(argv[1]);
+    e = atoll(argv[2]);
+    if (n <= 1 || e <= 0) { fprintf(stderr, "error: bad sizes\n"); return 2; }
   }
   GapCsr g;
-  if (!gap_gen(n, e, 0, &seed, &g)) { fprintf(stderr, "oom\n"); return 2; }
+  if (file_mode) {
+    if (!gap_load(argv[2], 0, &seed, &g)) return 2;
+  } else {
+    if (!gap_gen(n, e, 0, &seed, &g)) { fprintf(stderr, "oom\n"); return 2; }
+  }
+  n = g.n;  // authoritative after either path
+  if (source < 0 || source >= n) {
+    fprintf(stderr, "error: source out of range [0,%d)\n", n);
+    return 2;
+  }
+
   int32_t *parent = (int32_t *)malloc((size_t)n * sizeof(int32_t));
   int32_t *ref = (int32_t *)malloc((size_t)n * sizeof(int32_t));
   int32_t *q = (int32_t *)malloc((size_t)n * sizeof(int32_t));

@@ -1,0 +1,2 @@
+checksum gap_cc: 0 (0x0p+0)
+RESULT: PASS

@@ -1,0 +1,2 @@
+checksum gap_sssp_natural: 6563865358780 (0x1.7e11373c6fp+42)
+RESULT: PASS

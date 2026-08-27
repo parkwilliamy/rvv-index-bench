@@ -36,12 +36,24 @@ tolerance bands.
 
 `out[b][d] = Σ_i table[idx[b][i]][d]` — the embedding-pooling kernel
 that dominates DLRM-class recommendation inference. Table stays
-row-major (as in FBGEMM); the **bag** is the vector axis: `vle32` the
-bag's ids → `vsll` → `vluxei32` one component from L rows → ordered
-redsum, looped over the dim. Fixed bag length `L` (production
-inference is dominated by fixed-length pooling).
+row-major and the indices int64 (PyTorch EmbeddingBag's index dtype;
+FBGEMM's `IndexType`); the **bag** is the vector axis: `vle64` the
+bag's ids → `vsll` → `vluxei64` one f32 component from L rows
+(mixed-EEW gather) → ordered redsum, looped over the dim. Fixed bag
+length `L` (production inference is dominated by fixed-length
+pooling).
 
 *Args:* `rows dim(pow2) bags bag_len seed`
+
+> **Known simulator issue:** at large configs (e.g. the golden args)
+> this kernel currently returns NaN under gem5 with vector chaining
+> enabled — gcc allocates its gather as dest==index (`vluxei64
+> v2,(a2),v2`), which trips an open pinned-destination write-ordering
+> hazard in the chaining machinery (see gem5 DOCUMENTATION.MD,
+> "Chaining: pinned-destination write-ordering hazard"). It passes with
+> `--disable-chaining` and on the host. The golden below is the host
+> value; the other ten benchmarks reproduce their goldens bit-exactly
+> in gem5 with chaining on.
 
 *Kernel sources:* FBGEMM `EmbeddingSpMDM` — reference semantics in
 [`src/RefImplementations.cc:1551-1565` @ v0.6.0](https://github.com/pytorch/FBGEMM/blob/v0.6.0/src/RefImplementations.cc#L1551-L1565)
@@ -67,8 +79,9 @@ K/V caches live in fixed-size pages; a block table maps logical
 blocks to scattered physical pages. Scores, softmax, and the
 V-weighted sum all reach token rows through that indirection. A
 scalar prologue resolves block-table + page-offset into a per-token
-byte-offset array (the index stream); both attention phases then run
-token-strips: `vle32` offsets → `vluxei32` K (or V) per component.
+int64 byte-offset array (the index stream; upstream address math is
+64-bit); both attention phases then run token-strips: `vle64`
+offsets → `vluxei64` K (or V) f32 per component (mixed-EEW).
 
 *Args:* `dim(pow2) page_size num_pages ctx_len seed`
 
@@ -228,7 +241,9 @@ gather `:102`.
 
 Scalar forward BFS (path counts f64, per-edge successor bytes, depth
 slices); the backward dependency accumulation gathers `deltas[]`
-(f32) per successor strip — exact (depth d+1 finalized before d).
+(f32) AND `path_counts[]` (f64, mixed-EEW `vluxei32` with <<3
+offsets) per successor strip, matching upstream's two indirect reads
+— exact (depth d+1 finalized before d).
 Only the backward pass is inside the ROI. Blocker: conditional FP
 division (masked-divide speculation) plus f64/f32 mixing. Upstream:
 [`bc.cc:130`](https://github.com/sbeamer/gapbs/blob/2972aeb2703165bafd921222f4ed7196f542d3a8/src/bc.cc#L130) (`path_counts[v]`, `deltas[v]`). Local
@@ -253,13 +268,178 @@ RiVec `_spmv` semantics: `y[r] = Σ a[k] * x[ja[k]]` over CSR
 (synthetic uniform column indices, fixed nnz/row). Upstream
 ([RALC88/riscv-vectorized-benchmark-suite `_spmv/src/spmv.c`](https://github.com/RALC88/riscv-vectorized-benchmark-suite/blob/master/_spmv/src/spmv.c)):
 serial indirect read `sum += a[idx] * x[ja[idx]]` at L50, vector
-gather `_MM_LOAD_INDEX_f64(x, v_idx_row, gvl)` at L37 — upstream is
-f64/64-bit-index; this port is f32/int32 per the suite's e32m1 rule,
-raw intrinsics. Autovec is not trusted here for the same reason as
-gap_pr (it emits the widening chain), so the kernel is intrinsic
-with autovec off. Local sites: index load `src/rivec_spmv.c:62`,
+gather `_MM_LOAD_INDEX_f64(x, v_idx_row, gvl)` at L37. This port
+keeps the upstream element sizes — f64 values and int64 indices,
+e64m1 like RiVec's `_MMR_VSETVL_E64M1` — with raw intrinsics and
+autovec off (deterministic codegen; FP reduction reassociation). Local sites: index load `src/rivec_spmv.c:62`,
 x gather `:64`.
 *Args:* `rows cols nnz_per_row seed`
+
+## Natural-vectorization GAP variants (`src/gap_*_natural.c`)
+
+Counterpart experiment to the gather-formulated GAP ports above.
+Those ports were written indexed-ops-first: data structures were
+widened to make tests gather-able (bfs's Bitmap → int32 flags) and
+gathered strips were spilled to stack buffers and re-scanned scalar,
+lane by lane. Each `*_natural` file instead starts from the ORIGINAL
+GAPBS serial kernel and changes **only what vectorization itself
+requires** — the question they exist to answer being whether
+gathers/scatters still get emitted when nobody is optimizing for
+them.
+
+**How the original shapes are preserved:**
+
+- **Original data structures, element sizes, and layouts.** The
+  Bitmap frontier stays a bitmap, dist/comp stay int32, sssp keeps
+  GAPBS's interleaved `{v, w}` pairs, bc keeps f64 path counts next
+  to f32 deltas. Nothing is widened, split, or re-laid-out to
+  make an access indexable.
+- **Original loop nests and trajectories.** The vector axis is the
+  inner neighbor/edge loop in every kernel — the axis the serial
+  code already iterates — and lane order equals serial iteration
+  order, so bfs picks the same first-hit parent, sssp pushes buckets
+  in the same order, and bc rounds in the same order. Three of the
+  five (`bfs`, `sssp`, `bc`) are exactly serial-equivalent, verified
+  by `memcmp` against the *unmodified* serial algorithm; cc/cc_sv
+  need the same fixed 64-block snapshot device as their
+  gather-formulated counterparts (the hooking store makes any
+  vectorization VLEN-sensitive otherwise), mirrored in the scalar
+  reference.
+- **Serial parts stay serial.** Compare-and-set parent updates,
+  growable bucket pushes, Link's label chase, and bit-granular
+  bitmap writes are not conflict-free — the natural versions leave
+  them scalar rather than restructure them into scatters.
+
+**What "enabling vectorization" added** — three moves, all
+register-side, none touching the memory layout:
+
+1. **Speculate past data-dependent exits/branches.** The compiler's
+   blocker in every kernel is an early `break` or conditional it
+   cannot speculate across; a human knows the arrays are in-bounds
+   and read-only during the step, gathers the whole strip, and
+   resolves the condition afterwards with mask ops (`vmsne`/`vmslt`
+   → `vfirst`/`vcpop`).
+2. **Consume gathered values in registers.** Membership tests,
+   relax compares, and label compares happen in vector; at most 0/1
+   flags or mask bits cross to the scalar side. `vcpop == 0` retires
+   a strip with no scalar work at all — the dominant case late in
+   sssp/cc/cc_sv.
+3. **Mask instead of restructure.** bc's `if (succ[j])` becomes a
+   mask from one unit-stride `vle8` and the gathers execute under it
+   (`vluxei32 ..., v0.t`), so inactive lanes make no memory access —
+   if-conversion, not loop surgery.
+
+**The finding:** the gathers SURVIVE in all five kernels. Every hot
+loop's central read (`front`/`comp`/`dist`/`deltas`+`path_counts`)
+is indexed by data, so any vectorization of the loop emits it —
+these workloads are indexed-load benchmarks by nature, not by
+formulation. What disappears is the *manufactured* traffic: bfs
+gathers the original n/8-byte bitmap words instead of a widened
+4n-byte flag array, and the buffer spill/re-scan of every strip is
+gone. `gap_pr` has no `_natural` variant on purpose: its existing
+kernel (gather + ordered redsum straight off the serial pull loop)
+already **is** the natural vectorization.
+
+All five verify bit-exactly against their scalar mirrors, and all
+five default-config checksums equal the original variants' goldens.
+Args and upstream citations are identical to the counterparts.
+Per-file notes and local access sites:
+
+#### `src/gap_bfs_natural.c` — direction-optimizing BFS
+
+The bottom-up membership search keeps GAPBS's Bitmap: gather the
+frontier **words** (`front[v >> 5]`), extract bit `v & 31` with
+`vsrl.vv`/`vand`, `vmsne` → `vfirst` for the first frontier
+neighbor. Serial-exact (first-hit order preserved); top-down step
+and queue↔bitmap conversions stay scalar (compare-and-set;
+bit-granular RMW is not conflict-free). Sites: index load
+`src/gap_bfs_natural.c:113`, bitmap-word gather `:115`.
+
+**Diff vs `src/gap_bfs.c`:** the counterpart widens the frontier to
+an int32 flag array (4n bytes; `next[u] = 1` word stores), gathers
+full flag words at `(v << 2)`, spills them to a stack buffer
+(`vse32`), and scans the buffer scalar lane-by-lane for the first
+hit. Natural keeps the n/8-byte bitmap — the gather index becomes
+`((v >> 5) << 2)` (32:1 index aliasing into far fewer lines) — and
+the membership test is consumed in registers (`vmsne` → `vfirst`),
+no spill, no per-lane scalar scan. Row loop, `parent[u] < 0` gate,
+and strip-granular break are identical.
+
+#### `src/gap_cc_sv_natural.c` — Shiloach-Vishkin components
+
+comp[] gathered per 64-block and vector-compared against the
+block's `comp[u]` snapshot; `vcpop`-skip for settled blocks; flagged
+lanes run the ORIGINAL hooking body with live comp[] reads. Sites:
+index load `src/gap_cc_sv_natural.c:85`, comp gather `:81`.
+
+**Diff vs `src/gap_cc_sv.c`:** the counterpart spills every gathered
+comp[] block to a stack buffer (`vse32`) and runs the whole hooking
+body scalar for every lane against the buffered snapshot. Natural
+never spills the values — the `comp_u == comp_v` test moves to
+vector (`vmsne` vs the block's `comp[u]` snapshot), `vcpop == 0`
+skips settled blocks outright (zero scalar work), only 0/1 lane
+flags cross to the scalar side, and flagged lanes re-read comp[]
+LIVE instead of using buffered values. Same fixed 64-block snapshot
+device; trajectories and goldens are identical.
+
+#### `src/gap_cc_natural.c` — Afforest components
+
+Same vector filter for the final link phase; flagged lanes call the
+original scalar `Link`. The `vcpop`-skip is the dominant case
+post-sampling — which is Afforest's own premise. Sites: index load
+`src/gap_cc_natural.c:123`, comp gather `:119`.
+
+**Diff vs `src/gap_cc.c`:** same delta as cc_sv — the counterpart
+spills the gathered comp[] block to a buffer and does the
+label-differs filter as a scalar compare per lane over that buffer
+before calling `Link`. Natural does the filter in vector (`vmsne` +
+`vcpop`), skips whole blocks with no differing label — the dominant
+case after sampling — and passes only 0/1 flags to the scalar side;
+gathered values never leave registers. `Link` itself, the sampling,
+and the neighbor-rounds phase are identical in both.
+
+#### `src/gap_sssp_natural.c` — delta-stepping SSSP
+
+`nd = dist[u] + w` and the relax test move to vector (`vmslt`
+against the gathered distances — a provably exact prefilter, since
+dist[] only decreases); `vcpop == 0` strips retire with no spill;
+surviving strips spill ids/nd plus mask bits (`vsm`), and surviving
+lanes run the exact serial update against live dist[]. Serial-exact
+including bucket push order. Sites: strided id/weight loads
+`src/gap_sssp_natural.c:108`/`:111`, dist gather `:113`.
+
+**Diff vs `src/gap_sssp.c`:** the counterpart spills THREE buffers
+per strip — ids, weights, and the gathered distances — and runs the
+`nd` add plus the stale-filter compare scalar for every lane.
+Natural computes `nd` (`vadd.vx`) and the relax test (`vmslt`) in
+vector; a `vcpop == 0` strip retires with no spill and no scalar
+work at all (the dominant case late in the search), and only
+surviving strips spill — ids + nd + mask bits (`vsm`), the weights
+and distance buffers are gone entirely. Producer shape (two
+stride-8 `vlse32`), bucket fusion, and push order are identical.
+
+#### `src/gap_bc_natural.c` — Brandes betweenness centrality
+
+Successor test from one unit-stride `vle8` (e8mf4) + `vmsne`;
+`vcpop`-skip for strips with no successor edges; MASKED `vluxei32`
+gathers of deltas (f32) and path_counts (f64, mixed-EEW) touch only
+active lanes. The FP accumulation stays scalar per active lane:
+matching the serial result bit-for-bit needs each f64 term rounded
+to f32 before the f32 sum, and `vfncvt` is banned in this suite for
+hitting known gem5 RVV bugs. Sites: succ mask load
+`src/gap_bc_natural.c:137`, index load `:143`, masked deltas gather
+`:146`, masked path_counts gather `:149`.
+
+**Diff vs `src/gap_bc.c`:** the counterpart gathers deltas[] and
+path_counts[] UNMASKED for every lane of every strip and tests
+`succ` scalar, byte-by-byte, after the fact — successor-free lanes
+still cost two gather accesses each. Natural loads the successor
+bytes as a vector (`vle8` e8mf4, a new unit-stride producer),
+builds the mask first (`vmsne`), skips strips with no successors
+via `vcpop`, and runs both gathers UNDER the mask, so inactive
+lanes make no memory access. The per-active-lane scalar FP
+accumulation (f64→f32 rounding per term; `vfncvt` banned) is the
+same in both.
 
 ## Verification & goldens
 
@@ -281,7 +461,12 @@ gem5 runs) must reproduce them exactly:
 | gap_sssp | `65536 262144 3 16 1` | `6563865358780` (`0x1.7e11373c6fp+42`) |
 | gap_bc | `65536 262144 3 1` | `376576.9998091124` (`0x1.6fc03ffcdf5cp+18`) |
 | gap_pr | `65536 262144 20 1` | `0.99965455636402112` (`0x1.ffd2b8d5c3p-1`) |
-| rivec_spmv | `65536 65536 16 1` | `-253.21489938267041` (`-0x1.fa6e074ab9p+7`) |
+| rivec_spmv | `65536 65536 16 1` | `-253.21490919923698` (`-0x1.fa6e08941caa3p+7`) |
+| gap_bfs_natural | `65536 262144 3 1` | `2151931909` (`0x1.0087c00ap+31`) |
+| gap_cc_natural | `65536 262144 1` | `698770` (`0x1.55324p+19`) |
+| gap_cc_sv_natural | `65536 262144 1` | `698770` (`0x1.55324p+19`) |
+| gap_sssp_natural | `65536 262144 3 16 1` | `6563865358780` (`0x1.7e11373c6fp+42`) |
+| gap_bc_natural | `65536 262144 3 1` | `376576.9998091124` (`0x1.6fc03ffcdf5cp+18`) |
 
 Regenerate with `make host` and running the `_host` binaries with the
 args above.

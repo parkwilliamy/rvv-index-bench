@@ -18,6 +18,9 @@
  *   - Switch Transformers: Fedus et al., JMLR 2022 (top-1 routing).
  *   - token permute/unpermute kernels in vLLM / DeepSpeed-MoE.
  *
+ * Element sizes are the upstream ones already: int32 permutation
+ * indices (MegaBlocks uses int32 bins/indices) and f32 tokens.
+ *
  * RVV formulation: tokens stay ROW-MAJOR; the vector axis is the
  * PERMUTATION SLOT. Dispatch: vle32 src ids -> vsll -> vluxei32
  * gather of component d across tokens, strided vsse32 into xperm.

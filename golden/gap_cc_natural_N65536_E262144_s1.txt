@@ -1,0 +1,2 @@
+checksum gap_cc_natural: 698770 (0x1.55324p+19)
+RESULT: PASS
