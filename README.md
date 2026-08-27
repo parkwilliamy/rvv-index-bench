@@ -355,15 +355,18 @@ and queue↔bitmap conversions stay scalar (compare-and-set;
 bit-granular RMW is not conflict-free). Sites: index load
 `src/gap_bfs_natural.c:113`, bitmap-word gather `:115`.
 
-**Diff vs `src/gap_bfs.c`:** the counterpart widens the frontier to
-an int32 flag array (4n bytes; `next[u] = 1` word stores), gathers
-full flag words at `(v << 2)`, spills them to a stack buffer
-(`vse32`), and scans the buffer scalar lane-by-lane for the first
-hit. Natural keeps the n/8-byte bitmap — the gather index becomes
-`((v >> 5) << 2)` (32:1 index aliasing into far fewer lines) — and
-the membership test is consumed in registers (`vmsne` → `vfirst`),
-no spill, no per-lane scalar scan. Row loop, `parent[u] < 0` gate,
-and strip-granular break are identical.
+**Diff vs upstream `bfs.cc`:** upstream is OpenMP-parallel —
+SlidingQueue with thread-local QueueBuffers, `compare_and_swap`
+parent claims in TDStep (`bfs.cc:79`), parallel queue↔bitmap
+conversions. This port serializes all of that: plain `q`/`nq`
+arrays, direct parent stores, scalar conversions — same alpha=15/
+beta=18 control and negative-degree parent encoding. The only
+kernel change is vectorizing the BU membership search, whose one
+memory-visible delta is speculation: the serial loop reads
+neighbors only up to the first frontier hit, the vector strip reads
+all `vl` neighbor ids and frontier words before `vfirst` resolves
+the break. Data structures are upstream's exactly (uint32 Bitmap,
+int32 parent).
 
 #### `src/gap_cc_sv_natural.c` — Shiloach-Vishkin components
 
@@ -372,15 +375,17 @@ block's `comp[u]` snapshot; `vcpop`-skip for settled blocks; flagged
 lanes run the ORIGINAL hooking body with live comp[] reads. Sites:
 index load `src/gap_cc_sv_natural.c:85`, comp gather `:81`.
 
-**Diff vs `src/gap_cc_sv.c`:** the counterpart spills every gathered
-comp[] block to a stack buffer (`vse32`) and runs the whole hooking
-body scalar for every lane against the buffered snapshot. Natural
-never spills the values — the `comp_u == comp_v` test moves to
-vector (`vmsne` vs the block's `comp[u]` snapshot), `vcpop == 0`
-skips settled blocks outright (zero scalar work), only 0/1 lane
-flags cross to the scalar side, and flagged lanes re-read comp[]
-LIVE instead of using buffered values. Same fixed 64-block snapshot
-device; trajectories and goldens are identical.
+**Diff vs upstream `cc_sv.cc`:** upstream scans all edges each SV
+iteration in parallel, hooking `comp[high] = low` with benign
+OpenMP races. This port serializes the scan and adds the ONE
+semantic device upstream lacks: the fixed 64-block snapshot filter
+— a block's comp[] gathers and compares all complete against the
+pre-block state before any lane hooks, so a lane whose label
+changed mid-block is deferred to the next SV iteration instead of
+seen immediately. Same fixpoint, and the change flag matches at the
+fixpoint; the hooking body and the pointer-jump compression pass
+are upstream's unchanged. The device exists to make the trajectory
+VLEN-independent and is mirrored in the scalar reference.
 
 #### `src/gap_cc_natural.c` — Afforest components
 
@@ -389,14 +394,16 @@ original scalar `Link`. The `vcpop`-skip is the dominant case
 post-sampling — which is Afforest's own premise. Sites: index load
 `src/gap_cc_natural.c:123`, comp gather `:119`.
 
-**Diff vs `src/gap_cc.c`:** same delta as cc_sv — the counterpart
-spills the gathered comp[] block to a buffer and does the
-label-differs filter as a scalar compare per lane over that buffer
-before calling `Link`. Natural does the filter in vector (`vmsne` +
-`vcpop`), skips whole blocks with no differing label — the dominant
-case after sampling — and passes only 0/1 flags to the scalar side;
-gathered values never leave registers. `Link` itself, the sampling,
-and the neighbor-rounds phase are identical in both.
+**Diff vs upstream `cc.cc`:** upstream Afforest is parallel (CAS
+inside Link, `cc.cc:50`), samples the frequent component with
+`std::mt19937`, and its finish phase calls Link on EVERY remaining
+neighbor unconditionally (plus in-neighbors for directed graphs).
+This port serializes Link (plain stores), samples with the suite's
+deterministic RNG (seed 42, `FREQ_SAMPLES`), is undirected-only,
+and adds the 64-block snapshot filter as a work-elision device
+absent upstream: lanes whose snapshot label equals `comp[u]` are
+provably in the same set already, so their Link calls are skipped.
+neighbor_rounds=2 and the compress pass match upstream.
 
 #### `src/gap_sssp_natural.c` — delta-stepping SSSP
 
@@ -408,15 +415,16 @@ lanes run the exact serial update against live dist[]. Serial-exact
 including bucket push order. Sites: strided id/weight loads
 `src/gap_sssp_natural.c:108`/`:111`, dist gather `:113`.
 
-**Diff vs `src/gap_sssp.c`:** the counterpart spills THREE buffers
-per strip — ids, weights, and the gathered distances — and runs the
-`nd` add plus the stale-filter compare scalar for every lane.
-Natural computes `nd` (`vadd.vx`) and the relax test (`vmslt`) in
-vector; a `vcpop == 0` strip retires with no spill and no scalar
-work at all (the dominant case late in the search), and only
-surviving strips spill — ids + nd + mask bits (`vsm`), the weights
-and distance buffers are gone entirely. Producer shape (two
-stride-8 `vlse32`), bucket fusion, and push order are identical.
+**Diff vs upstream `sssp.cc`:** upstream delta-stepping is parallel
+— thread-local bins, a shared frontier swap, and a
+`compare_and_swap` relax loop (`sssp.cc:130`). This port serializes
+the driver (single bin set, plain compare-and-store relax) with the
+same delta binning, bucket fusion (threshold 1000), and interleaved
+`{v, w}` NodeWeight layout. The vector relax prefilter reads
+`dist[v]` for the whole strip up front, but the serial body reads
+every `dist[wn.v]` anyway, so the memory footprint is unchanged —
+the prefilter is exact by dist monotonicity, and dist, buckets, and
+push order are bit-identical to the serial run.
 
 #### `src/gap_bc_natural.c` — Brandes betweenness centrality
 
@@ -430,16 +438,17 @@ hitting known gem5 RVV bugs. Sites: succ mask load
 `src/gap_bc_natural.c:137`, index load `:143`, masked deltas gather
 `:146`, masked path_counts gather `:149`.
 
-**Diff vs `src/gap_bc.c`:** the counterpart gathers deltas[] and
-path_counts[] UNMASKED for every lane of every strip and tests
-`succ` scalar, byte-by-byte, after the fact — successor-free lanes
-still cost two gather accesses each. Natural loads the successor
-bytes as a vector (`vle8` e8mf4, a new unit-stride producer),
-builds the mask first (`vmsne`), skips strips with no successors
-via `vcpop`, and runs both gathers UNDER the mask, so inactive
-lanes make no memory access. The per-active-lane scalar FP
-accumulation (f64→f32 rounding per term; `vfncvt` banned) is the
-same in both.
+**Diff vs upstream `bc.cc`:** upstream Brandes is parallel — CAS on
+depths and atomic path-count adds in the forward BFS, SlidingQueue
+depth slices, parallel backward accumulation per depth. This port
+serializes both passes (plain queue + depth_index array) and makes
+the suite's one data-structure widening: upstream stores successor
+flags as a per-EDGE Bitmap (`bc.cc:115`, m/8 bytes); here succ is a
+byte array (m bytes) so the successor test is a single unit-stride
+`vle8` per strip instead of a bit-granular word dance. path_counts
+f64 / deltas f32 / scores f32 match upstream's CountT/ScoreT, the
+per-term f64→f32 rounding order is serial-exact, and (as in the
+counterpart) only the backward pass is inside the ROI.
 
 ## Verification & goldens
 
